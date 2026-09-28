@@ -1,0 +1,31 @@
+# Tear the dev environment down to stop paying for the load balancer and Fargate tasks.
+name: Destroy
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: Type "destroy-dev" to confirm
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  destroy:
+    if: github.event.inputs.confirm == 'destroy-dev'
+    runs-on: ubuntu-latest
+    environment: dev
+    defaults:
+      run:
+        working-directory: terraform/envs/dev
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+      - uses: hashicorp/setup-terraform@v3
+      - run: terraform init -input=false -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" -backend-config="region=${{ vars.AWS_REGION || 'us-east-1' }}"
+      - run: terraform destroy -input=false -auto-approve -var "image_tag=unused"

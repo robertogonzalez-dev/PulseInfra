@@ -1,0 +1,86 @@
+# Build the PulseForecast image, push it to ECR, and roll it out to ECS through Terraform.
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_ref:
+        description: PulseForecast git ref to deploy
+        default: main
+  repository_dispatch:
+    types: [pulse-forecast-released]
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-dev
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  APP_REPO: robertogonzalez-dev/PulseForecast
+  APP_REF: ${{ github.event.inputs.app_ref || github.event.client_payload.ref || 'main' }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: dev
+    defaults:
+      run:
+        working-directory: terraform/envs/dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.APP_REPO }}
+          ref: ${{ env.APP_REF }}
+          path: app
+
+      - id: app
+        run: echo "sha=$(git -C "$GITHUB_WORKSPACE/app" rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - run: terraform init -input=false -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" -backend-config="region=${{ env.AWS_REGION }}"
+
+      # The registry must exist before the first push.
+      - run: terraform apply -input=false -auto-approve -target=module.ecr -var "image_tag=${{ steps.app.outputs.sha }}"
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image (skipped if this SHA is already in ECR)
+        working-directory: app
+        run: |
+          IMAGE="${{ steps.ecr.outputs.registry }}/pulse-forecast:${{ steps.app.outputs.sha }}"
+          if aws ecr describe-images --repository-name pulse-forecast --image-ids imageTag=${{ steps.app.outputs.sha }} >/dev/null 2>&1; then
+            echo "Image already exists: $IMAGE"
+          else
+            docker build -t "$IMAGE" .
+            docker push "$IMAGE"
+          fi
+
+      - run: terraform apply -input=false -auto-approve -var "image_tag=${{ steps.app.outputs.sha }}"
+
+      - name: Wait for the service to stabilize
+        run: |
+          aws ecs wait services-stable \
+            --cluster "$(terraform output -raw cluster_name)" \
+            --services "$(terraform output -raw service_name)"
+
+      - name: Smoke test
+        run: |
+          URL="$(terraform output -raw url)"
+          for i in $(seq 1 20); do curl -sf "$URL/health" && break; sleep 6; done
+          curl -sf -X POST "$URL/forecast" -H 'Content-Type: application/json' -d '{"sku":"SKU-001","horizon":7}'
+          echo "::notice title=Deployed::$URL/docs"
